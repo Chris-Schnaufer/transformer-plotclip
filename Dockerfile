@@ -1,28 +1,26 @@
-FROM terraref/terrautils:1.4
-MAINTAINER Max Burnette <mburnet2@illinois.edu>
+# Version 1.0 template-transformer-simple 
 
-# Install any programs needed
-RUN useradd -u 49044 extractor
+FROM agpipeline/gantry-base-image:latest
+LABEL maintainer="Chris Schnaufer <schnaufer@email.arizona.edu>"
 
-# Install laser3d science package
-RUN pip install laspy terraref-laser3d
+COPY requirements.txt packages.txt /home/extractor/
 
-# Install PDAL
-RUN apt-get update \
-    && apt-get install -y pdal
+USER root
 
-# command to run when starting docker
-COPY entrypoint.sh extractor_info.json *.py /home/extractor/
+RUN [ -s /home/extractor/packages.txt ] && \
+    (echo 'Installing packages' && \
+        apt-get update && \
+        cat /home/extractor/packages.txt | xargs apt-get install -y --no-install-recommends && \
+        rm /home/extractor/packages.txt && \
+        apt-get autoremove -y && \
+        apt-get clean && \
+        rm -rf /var/lib/apt/lists/*) || \
+    (echo 'No packages to install' && \
+        rm /home/extractor/packages.txt)
+
+RUN python3 -m pip install --no-cache-dir -r /home/extractor/requirements.txt && \
+    rm /home/extractor/requirements.txt
 
 USER extractor
-ENTRYPOINT ["/home/extractor/entrypoint.sh"]
-CMD ["extractor"]
 
-# Setup environment variables. These are passed into the container. You can change
-# these to your setup. If RABBITMQ_URI is not set, it will try and use the rabbitmq
-# server that is linked into the container. MAIN_SCRIPT is set to the script to be
-# executed by entrypoint.sh
-ENV RABBITMQ_EXCHANGE="terra" \
-    RABBITMQ_VHOST="%2F" \
-    RABBITMQ_QUEUE="terra.plotclipper" \
-    MAIN_SCRIPT="terra_plotclipper.py"
+COPY *.py /home/extractor/
