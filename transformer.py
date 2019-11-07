@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import yaml
 import liblas
 
@@ -17,11 +18,14 @@ import osr
 
 from terrautils.imagefile import image_get_geobounds, get_epsg
 from terrautils.spatial import find_plots_intersect_boundingbox, geojson_to_tuples_betydb, clip_raster, \
-     clip_las, geometry_to_geojson, convert_json_geometry
+     geometry_to_geojson, convert_json_geometry
 from terrautils.betydb import get_site_boundaries
+import terrautils.lemnatec
 
 import configuration
 import transformer_class
+
+terrautils.lemnatec.SENSOR_METADATA_CACHE = os.path.dirname(os.path.realpath(__file__))
 
 
 class __internal__():
@@ -75,7 +79,7 @@ class __internal__():
             of the image is not returned (None) and a warning is logged.
         """
         # Get the bounds and the EPSG code
-        las_info = liblas.file.File(file_path, 'r')
+        las_info = liblas.file.File(file_path, mode='r')
         min_bound = las_info.header.min
         max_bound = las_info.header.max
         epsg = __internal__.get_las_epsg_from_header(las_info.header)
@@ -104,6 +108,45 @@ class __internal__():
         logging.error("Failed to import EPSG %s for las file %s", str(epsg), file_path)
         return None
 
+    @staticmethod
+    def clip_las(las_path: str, clip_tuple: tuple, out_path: str, merged_path: str = None) -> None:
+        """Clip LAS file to polygon.
+        Arguments:
+          las_path: path to pointcloud file
+          clip_tuple: tuple containing (minX, maxX, minY, maxY) of clip bounds
+          out_path: output file to write
+          merge_path: optional path to write merged data to
+        Notes:
+            The clip_tuple is assumed to be in the correct coordinate system for the point cloud file
+        """
+        bounds_str = "([%s, %s], [%s, %s])" % (clip_tuple[2], clip_tuple[3], clip_tuple[0], clip_tuple[1])
+
+        pdal_dtm = out_path.replace(".las", "_dtm.json")
+        with open(pdal_dtm, 'w') as dtm:
+            dtm.write("""{
+                "pipeline": [
+                    "%s",
+                    {
+                        "type": "filters.crop",
+                        "bounds": "%s"
+                    },
+                    {
+                        "type": "writers.las",
+                        "filename": "%s"
+                    }
+                ]
+            }""" % (las_path, bounds_str, out_path))
+
+        cmd = 'pdal pipeline "%s"' % pdal_dtm
+        subprocess.call([cmd], shell=True)
+        os.remove(pdal_dtm)
+
+        if merged_path:
+            if os.path.isfile(merged_path):
+                cmd = 'pdal merge "%s" "%s" "%s"' % (out_path, merged_path, merged_path)
+                subprocess.call([cmd], shell=True)
+            else:
+                os.rename(out_path, merged_path)
 
     @staticmethod
     def get_image_bounds_json(file_path: str, default_epsg: int = None) -> str:
@@ -245,6 +288,63 @@ class __internal__():
         return new_md
 
     @staticmethod
+    def check_already_merged(merged_file: str, source_file: str) -> bool:
+        """Checks if the source file is listed in the merged file
+        Arguments:
+            merged_file: path to the merged file to check
+            source_file: the name of the source file to look for
+        Return:
+            Returns True if the source file name is found in the contents of the merged file and False otherwise
+        """
+        already_merged = False
+        if os.path.exists(merged_file):
+            # Check if contents
+            with open(merged_file, 'r') as contents:
+                for entry in contents.readlines():
+                    if entry.strip() == source_file:
+                        already_merged = True
+                        break
+        return already_merged
+
+
+    @staticmethod
+    def prepare_container_md(plot_name: str, plot_md: dict, sensor: str, source_file: str, result_files: list) -> dict:
+        """Prepares the metadata for a single container
+        Arguments:
+            plot_name: the name of the container
+            plot_md: the metadata associated with this container
+            sensor: the name of the related sensor
+            source_file: the name of the source file
+            result_files: list of files to add to container metadata
+        Return:
+            The formatted metadata
+        Notes:
+            The files in result_files are checked for existence before being added to the metadata
+        """
+        cur_md = {
+            'name': plot_name,
+            'metadata': {
+                'replace': True,
+                'data': plot_md
+            },
+            'file': []
+        }
+        for one_file in result_files:
+            if os.path.exists(one_file):
+                cur_md['file'].append({
+                    'path': one_file,
+                    'key': sensor,
+                    'metadata': {
+                        'source': source_file,
+                        'transformer': configuration.TRANSFORMER_NAME,
+                        'version': configuration.TRANSFORMER_VERSION,
+                        'timestamp': datetime.datetime.utcnow().isoformat(),
+                        'plot_name': plot_name
+                    }
+                })
+        return cur_md
+
+    @staticmethod
     def merge_container_md(dest_md: list, new_md: dict) -> list:
         """Merges container level metadata ensuring there aren't any plot-level
            duplicates or duplicate file entries for a plot entry
@@ -320,25 +420,29 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
     start_timestamp = datetime.datetime.now()
     file_list = check_md['list_files']()
     files_to_process = __internal__.get_files_to_process(file_list, transformer.args.sensor, transformer.args.epsg)
+    logging.info("Found %s files to process", str(len(files_to_process)))
 
     # Get all the possible plots
-    datestamp = datetime.datetime.fromisoformat(check_md['timestamp']).strftime('%Y-%m-%d')
+    datestamp = check_md['timestamp'][0:10]
     all_plots = get_site_boundaries(datestamp, city='Maricopa')
+    logging.debug("Have %s plots for site", len(all_plots))
 
     container_md = []
     for filename in files_to_process:
         processed_files += 1
         file_path = files_to_process[filename]['path']
         file_bounds = files_to_process[filename]['bounds']
-        sensor = files_to_process[filename]['sensor']
+        sensor = files_to_process[filename]['sensor_name']
 
         overlap_plots = find_plots_intersect_boundingbox(file_bounds, all_plots, fullmac=True)
+        logging.info("Have %s plots intersecting file '%s'", str(len(overlap_plots)), filename)
 
         file_spatial_ref = __internal__.get_spatial_reference_from_json(file_bounds)
         for plot_name in overlap_plots:
             processed_plots += 1
+            logging.debug("Clipping out plot: '%s'", plot_name)
             plot_bounds = convert_json_geometry(overlap_plots[plot_name], file_spatial_ref)
-            if __internal__.calculate_overlap_percent(plot_bounds, file_bounds) < 0.20:
+            if __internal__.calculate_overlap_percent(plot_bounds, file_bounds) < 0.10:
                 logging.info("Skipping plot with too small overlap: %s", plot_name)
                 continue
             tuples = geojson_to_tuples_betydb(yaml.safe_load(plot_bounds))
@@ -355,24 +459,7 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
 
                 clip_raster(file_path, tuples, out_path=out_file, compress=True)
 
-                cur_md = {
-                    'name': plot_name,
-                    'metadata': {
-                        'replace': True,
-                        'data': plot_md
-                    },
-                    'file': [{
-                        'path': out_file,
-                        'key': sensor,
-                        'metadata': {
-                            'source': file_path,
-                            'transformer': configuration.TRANSFORMER_NAME,
-                            'version': configuration.TRANSFORMER_VERSION,
-                            'timestamp': datetime.datetime.utcnow().isoformat(),
-                            'plot_name': plot_name
-                        }
-                    }]
-                }
+                cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file])
                 container_md = __internal__.merge_container_md(container_md, cur_md)
 
             elif filename.endswith('.las'):
@@ -384,58 +471,15 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
                 if not os.path.exists(out_path):
                     os.makedirs(out_path)
 
-                already_merged = False
-                if os.path.exists(merged_txt):
-                    # Check if contents
-                    with open(merged_txt, 'r') as contents:
-                        for entry in contents.readlines():
-                            if entry.strip() == file_path:
-                                already_merged = True
-                                break
-                if not already_merged:
-                    clip_las(file_path, tuples, out_path=out_file, merged_path=merged_out)
+                if not __internal__.check_already_merged(merged_txt, file_path):
+                    __internal__.clip_las(file_path, tuples, out_path=out_file, merged_path=merged_out)
                     with open(merged_txt, 'a') as contents:
                         contents.write(file_path + "\n")
 
-                    cur_md = {
-                        'name': plot_name,
-                        'metadata': {
-                            'replace': True,
-                            'data': plot_md
-                        },
-                        'file': [{
-                            'path': out_file,
-                            'key': sensor,
-                            'metadata': {
-                                'source': file_path,
-                                'transformer': configuration.TRANSFORMER_NAME,
-                                'version': configuration.TRANSFORMER_VERSION,
-                                'timestamp': datetime.datetime.utcnow().isoformat(),
-                                'plot_name': plot_name
-                            }
-                        }, {
-                            'path': merged_out,
-                            'key': sensor,
-                            'metadata': {
-                                'source': file_path,
-                                'transformer': configuration.TRANSFORMER_NAME,
-                                'version': configuration.TRANSFORMER_VERSION,
-                                'timestamp': datetime.datetime.utcnow().isoformat(),
-                                'plot_name': plot_name
-                            }
-                        }, {
-                            'path': merged_out,
-                            'key': sensor,
-                            'metadata': {
-                                'source': file_path,
-                                'transformer': configuration.TRANSFORMER_NAME,
-                                'version': configuration.TRANSFORMER_VERSION,
-                                'timestamp': datetime.datetime.utcnow().isoformat(),
-                                'plot_name': plot_name
-                            }
-                        }]
-                    }
+                    cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file, merged_out])
                     container_md = __internal__.merge_container_md(container_md, cur_md)
+                else:
+                    logging.info("Skipping already merged LAS data")
 
     return {
         'code': 0,
@@ -446,7 +490,7 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
             'processing_time': str(datetime.datetime.now() - start_timestamp),
             'total_file_count': len(file_list),
             'processed_file_count': processed_files,
-            'total_plots_count': processed_plots,
+            'total_plots_processed': processed_plots,
             'sensor': transformer.args.sensor
         }
     }

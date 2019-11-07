@@ -11,7 +11,7 @@ TRANSFORMER_DESCRIPTION = 'TERRA-REF plot clipper'
 TRANSFORMER_NAME = 'terra.plotclipper'
 
 # The sensor associated with the transformer
-TRANSFORMER_SENSOR = 'plotclipper'
+TRANSFORMER_SENSOR = 'scanner3DTop'
 
 # The transformer type (eg: 'rgbmask', 'plotclipper')
 TRANSFORMER_TYPE = 'plotclipper'
