@@ -119,11 +119,11 @@ class __internal__():
         Notes:
             The clip_tuple is assumed to be in the correct coordinate system for the point cloud file
         """
-        bounds_str = "([%s, %s], [%s, %s])" % (clip_tuple[2], clip_tuple[3], clip_tuple[0], clip_tuple[1])
+        bounds_str = "([%s, %s], [%s, %s])" % (clip_tuple[0], clip_tuple[1], clip_tuple[2], clip_tuple[3])
 
         pdal_dtm = out_path.replace(".las", "_dtm.json")
         with open(pdal_dtm, 'w') as dtm:
-            dtm.write("""{
+            dtm_data = """{
                 "pipeline": [
                     "%s",
                     {
@@ -135,15 +135,19 @@ class __internal__():
                         "filename": "%s"
                     }
                 ]
-            }""" % (las_path, bounds_str, out_path))
+            }""" % (las_path, bounds_str, out_path)
+            logging.debug("Writing dtm file contents: %s", str(dtm_data))
+            dtm.write(dtm_data)
 
         cmd = 'pdal pipeline "%s"' % pdal_dtm
+        logging.debug("Running pipeline command: %s", cmd)
         subprocess.call([cmd], shell=True)
         os.remove(pdal_dtm)
 
         if merged_path:
             if os.path.isfile(merged_path):
                 cmd = 'pdal merge "%s" "%s" "%s"' % (out_path, merged_path, merged_path)
+                logging.debug("Running merge command: %s", cmd)
                 subprocess.call([cmd], shell=True)
             else:
                 os.rename(out_path, merged_path)
@@ -440,8 +444,8 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
         file_spatial_ref = __internal__.get_spatial_reference_from_json(file_bounds)
         for plot_name in overlap_plots:
             processed_plots += 1
-            logging.debug("Clipping out plot: '%s'", plot_name)
             plot_bounds = convert_json_geometry(overlap_plots[plot_name], file_spatial_ref)
+            logging.debug("Clipping out plot '%s': %s", str(plot_name), str(plot_bounds))
             if __internal__.calculate_overlap_percent(plot_bounds, file_bounds) < 0.10:
                 logging.info("Skipping plot with too small overlap: %s", plot_name)
                 continue
