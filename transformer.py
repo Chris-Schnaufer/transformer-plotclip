@@ -9,6 +9,8 @@ import logging
 import os
 import re
 import subprocess
+from typing import Optional
+
 import yaml
 import liblas
 
@@ -64,7 +66,7 @@ class __internal__():
         return epsg
 
     @staticmethod
-    def get_las_extents(file_path: str, default_epsg: int = None) -> str:
+    def get_las_extents(file_path: str, default_epsg: int = None) -> Optional[str]:
         """Calculate the extent of the given las file and return as GeoJSON.
         Arguments:
             file_path: path to the file from which to load the bounds
@@ -109,13 +111,12 @@ class __internal__():
         return None
 
     @staticmethod
-    def clip_las(las_path: str, clip_tuple: tuple, out_path: str, merged_path: str = None) -> None:
+    def clip_las(las_path: str, clip_tuple: tuple, out_path: str) -> None:
         """Clip LAS file to polygon.
         Arguments:
-          las_path: path to pointcloud file
+          las_path: path to point cloud file
           clip_tuple: tuple containing (minX, maxX, minY, maxY) of clip bounds
           out_path: output file to write
-          merge_path: optional path to write merged data to
         Notes:
             The clip_tuple is assumed to be in the correct coordinate system for the point cloud file
         """
@@ -144,16 +145,8 @@ class __internal__():
         subprocess.call([cmd], shell=True)
         os.remove(pdal_dtm)
 
-        if merged_path:
-            if os.path.isfile(merged_path):
-                cmd = 'pdal merge "%s" "%s" "%s"' % (out_path, merged_path, merged_path)
-                logging.debug("Running merge command: %s", cmd)
-                subprocess.call([cmd], shell=True)
-            else:
-                os.rename(out_path, merged_path)
-
     @staticmethod
-    def get_image_bounds_json(file_path: str, default_epsg: int = None) -> str:
+    def get_image_bounds_json(file_path: str, default_epsg: int = None) -> Optional[str]:
         """Loads the boundaries of the image file and returns the GeoJSON
            representing the bounds (including EPSG code)
         Arguments:
@@ -232,7 +225,7 @@ class __internal__():
         return files_to_process
 
     @staticmethod
-    def get_spatial_reference_from_json(geojson):
+    def get_spatial_reference_from_json(geojson: str) -> Optional[osr.SpatialReference]:
         """Returns the spatial reference embedded in the geojson.
         Args:
             geojson(str): the geojson to get the spatial reference from
@@ -248,14 +241,14 @@ class __internal__():
         return None
 
     @staticmethod
-    def calculate_overlap_percent(check_bounds, bounding_box):
+    def calculate_overlap_percent(check_bounds: str, bounding_box: str) -> float:
         """Calculates and returns the percentage overlap between the two boundaries.
            The calculation determines the overlap shape between the two parameters and
            then calculates the percentage by dividing the overlap area by the bounding
            box area, and returns that value.
         Args:
-            check_bounds(str): GeoJSON of boundary to check
-            bounding_box(str): GeoJSON of boundary to check against
+            check_bounds: GeoJSON of boundary to check
+            bounding_box: GeoJSON of boundary to check against
         Return:
             The calculated overlap percent (0.0 - 1.0) or 0.0 if there is no overlap.
             If an exception is detected, a warning message is logged and 0.0 is returned.
@@ -362,7 +355,7 @@ class __internal__():
         if not dest_md:
             if new_md:
                 return [new_md]
-            return {}
+            return []
 
         # Copy the metadata and look for a match
         match_idx = -1
@@ -396,7 +389,6 @@ class __internal__():
 
         return dest_md
 
-
 def add_parameters(parser: argparse.ArgumentParser) -> None:
     """Adds parameters
     Arguments:
@@ -407,7 +399,7 @@ def add_parameters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('sensor', type=str, help='the name of the sensor associated with the source files')
 
 
-def perform_process(transformer: transformer_class.Transformer, check_md: dict, transformer_md: dict, full_md: dict) -> dict:
+def perform_process(transformer: transformer_class.Transformer, check_md: dict, transformer_md: dict, full_md: list) -> dict:
     """Performs the processing of the data
     Arguments:
         transformer: instance of transformer class
@@ -437,6 +429,7 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
         file_path = files_to_process[filename]['path']
         file_bounds = files_to_process[filename]['bounds']
         sensor = files_to_process[filename]['sensor_name']
+        logging.debug("File bounds: %s", str(file_bounds))
 
         overlap_plots = find_plots_intersect_boundingbox(file_bounds, all_plots, fullmac=True)
         logging.info("Have %s plots intersecting file '%s'", str(len(overlap_plots)), filename)
@@ -467,23 +460,15 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
                 container_md = __internal__.merge_container_md(container_md, cur_md)
 
             elif filename.endswith('.las'):
-                # If file is LAS, we can merge with any existing scan+plot output safely
                 out_path = os.path.join(check_md['working_folder'], plot_name)
                 out_file = os.path.join(out_path, filename)
-                merged_out = os.path.join(out_path, os.path.splitext(os.path.basename(filename))[0] + '_merged.las')
-                merged_txt = merged_out.replace('.las', '_contents.txt')
                 if not os.path.exists(out_path):
                     os.makedirs(out_path)
 
-                if not __internal__.check_already_merged(merged_txt, file_path):
-                    __internal__.clip_las(file_path, tuples, out_path=out_file, merged_path=merged_out)
-                    with open(merged_txt, 'a') as contents:
-                        contents.write(file_path + "\n")
+                __internal__.clip_las(file_path, tuples, out_path=out_file)
 
-                    cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file, merged_out])
-                    container_md = __internal__.merge_container_md(container_md, cur_md)
-                else:
-                    logging.info("Skipping already merged LAS data")
+                cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file])
+                container_md = __internal__.merge_container_md(container_md, cur_md)
 
     return {
         'code': 0,
