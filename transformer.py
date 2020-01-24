@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 from typing import Optional
+import netCDF4
 
 import yaml
 import liblas
@@ -28,6 +29,9 @@ import configuration
 import transformer_class
 
 terrautils.lemnatec.SENSOR_METADATA_CACHE = os.path.dirname(os.path.realpath(__file__))
+
+# The default EPSG code expected for netCDF files
+DEFAULT_NETCDF_EPSG_CODE = 4326
 
 
 class __internal__():
@@ -111,39 +115,45 @@ class __internal__():
         return None
 
     @staticmethod
-    def clip_las(las_path: str, clip_tuple: tuple, out_path: str) -> None:
-        """Clip LAS file to polygon.
+    def get_netcdf_extents(file_path: str) -> Optional[str]:
+        """Calculate the extent of the given netCDF file and return as GeoJSON.
         Arguments:
-          las_path: path to point cloud file
-          clip_tuple: tuple containing (minX, maxX, minY, maxY) of clip bounds
-          out_path: output file to write
-        Notes:
-            The clip_tuple is assumed to be in the correct coordinate system for the point cloud file
+            file_path: path to the file from which to load the bounds
+        Return:
+            Returns the JSON representing the netCDF boundary, or None if the
+            bounds could not be loaded
         """
-        bounds_str = "([%s, %s], [%s, %s])" % (clip_tuple[0], clip_tuple[1], clip_tuple[2], clip_tuple[3])
+        epsg = DEFAULT_NETCDF_EPSG_CODE
+        try:
+            with netCDF4.Dataset(file_path) as src:
+                # Get the variables we need (assumes a 90 degree rotation from North-up)
+                y_size = src.dimensions['y'].size
+                x_size = src.dimensions['x'].size
+                lat_min = src.variables['latitude'][0:1].data[0]
+                lon_min = src.variables['longitude'][0:1].data[0]
+                lat_max = src.variables['latitude'][x_size - 1:x_size].data[0]
+                lon_max = src.variables['longitude'][y_size - 1:y_size].data[0]
 
-        pdal_dtm = out_path.replace(".las", "_dtm.json")
-        with open(pdal_dtm, 'w') as dtm:
-            dtm_data = """{
-                "pipeline": [
-                    "%s",
-                    {
-                        "type": "filters.crop",
-                        "bounds": "%s"
-                    },
-                    {
-                        "type": "writers.las",
-                        "filename": "%s"
-                    }
-                ]
-            }""" % (las_path, bounds_str, out_path)
-            logging.debug("Writing dtm file contents: %s", str(dtm_data))
-            dtm.write(dtm_data)
+                ring = ogr.Geometry(ogr.wkbLinearRing)
+                ring.AddPoint(lon_min, lat_min)  # Upper left
+                ring.AddPoint(lon_max, lat_min)  # Upper right
+                ring.AddPoint(lon_max, lat_max)  # lower right
+                ring.AddPoint(lon_min, lat_max)  # lower left
+                ring.AddPoint(lon_min, lat_min)  # Closing the polygon
 
-        cmd = 'pdal pipeline "%s"' % pdal_dtm
-        logging.debug("Running pipeline command: %s", cmd)
-        subprocess.call([cmd], shell=True)
-        os.remove(pdal_dtm)
+                poly = ogr.Geometry(ogr.wkbPolygon)
+                poly.AddGeometry(ring)
+
+                ref_sys = osr.SpatialReference()
+                if ref_sys.ImportFromEPSG(int(epsg)) == ogr.OGRERR_NONE:
+                    poly.AssignSpatialReference(ref_sys)
+                    return geometry_to_geojson(poly)
+
+                logging.error("Failed to import EPSG %s for las file %s", str(epsg), file_path)
+        except Exception:
+            logging.exception("Exception caught while determining netCDF file extents %s", file_path)
+
+        return None
 
     @staticmethod
     def get_image_bounds_json(file_path: str, default_epsg: int = None) -> Optional[str]:
@@ -222,6 +232,12 @@ class __internal__():
                     'bounds': __internal__.get_las_extents(one_file, default_epsg),
                     'sensor_name': sensor
                 }
+            elif one_file.endswith(".nc"):
+                files_to_process[filename] = {
+                    'path': one_file,
+                    'bounds': __internal__.get_netcdf_extents(one_file),
+                    'sensor_name': sensor
+                }
         return files_to_process
 
     @staticmethod
@@ -267,6 +283,157 @@ class __internal__():
         return 0.0
 
     @staticmethod
+    def clip_las(las_path: str, clip_tuple: tuple, out_path: str) -> None:
+        """Clip LAS file to polygon.
+        Arguments:
+          las_path: path to point cloud file
+          clip_tuple: tuple containing (minX, maxX, minY, maxY) of clip bounds
+          out_path: output file to write
+        Notes:
+            The clip_tuple is assumed to be in the correct coordinate system for the point cloud file
+        """
+        bounds_str = "([%s, %s], [%s, %s])" % (clip_tuple[0], clip_tuple[1], clip_tuple[2], clip_tuple[3])
+
+        pdal_dtm = out_path.replace(".las", "_dtm.json")
+        with open(pdal_dtm, 'w') as dtm:
+            dtm_data = """{
+                "pipeline": [
+                    "%s",
+                    {
+                        "type": "filters.crop",
+                        "bounds": "%s"
+                    },
+                    {
+                        "type": "writers.las",
+                        "filename": "%s"
+                    }
+                ]
+            }""" % (las_path, bounds_str, out_path)
+            logging.debug("Writing dtm file contents: %s", str(dtm_data))
+            dtm.write(dtm_data)
+
+        cmd = 'pdal pipeline "%s"' % pdal_dtm
+        logging.debug("Running pipeline command: %s", cmd)
+        subprocess.call([cmd], shell=True)
+        os.remove(pdal_dtm)
+
+    @staticmethod
+    def netcdf_tuple_to_indexes(netcdf_path: str, clip_tuple: tuple) -> list:
+        """Converts the tuple lat-lon values to Y and X indexes
+        Arguments:
+          netcdf_path: path to netCDF file
+          clip_tuple: tuple containing (minX, maxX, minY, maxY) to convert
+        Return:
+            Returns a tuple containing (minYindex, maxYimdex, minXindex, maxXindex)
+        Exceptions:
+            Raises RuntimeError if the tuple is not able to be mapped to X, Y indexes
+        Notes:
+            The X, Y axises of the file are aligned east-west, north-south (x is oriented along latitude)
+        """
+        closest_offsets = []
+        with netCDF4.Dataset(netcdf_path) as src:
+            # Get the variables we need (assumes a 90 degree rotation from North-up)
+            y_size = float(src.dimensions['y'].size)
+            x_size = float(src.dimensions['x'].size)
+            latitudes = src.variables['latitude']
+            longitudes = src.variables['longitude']
+            lat_min = latitudes[0:1].data[0]
+            lon_min = longitudes[0:1].data[0]
+            lat_max = latitudes[x_size - 1:x_size].data[0]
+            lon_max = longitudes[y_size - 1:y_size].data[0]
+
+            # Get approximate X and Y of tuple values - assumes constant spacing of sensor points
+            # Y is assumed to be aligned along longitude
+            lat_diff = abs(lat_max - lat_min)
+            lon_diff = abs(lon_max - lon_min)
+            min_y = int(y_size * (abs(clip_tuple[0] - lon_min) / lon_diff))
+            max_y = int(y_size * (abs(clip_tuple[1] - lon_max) / lon_diff))
+            min_x = int(x_size * (abs(clip_tuple[2] - lat_min) / lat_diff))
+            max_x = int(x_size * (abs(clip_tuple[3] - lat_max) / lat_diff))
+            logging.debug("Approximate indexes: %s %s %s %s", str(min_y), str(max_y), str(min_x), str(max_x))
+
+            # Find the closest offsets to the plot boundary
+            def find_closest_index(value: float, value_index: int, variables: netCDF4.Variable) -> int:
+                """Finds the closes indexes for the values in the list
+                Arguments:
+                    value: the value to look up
+                    value_index: the index of value currently deemed closest
+                    variables: the variables to look into - assumed to be in order
+                Return:
+                    Returns an index corresponding to the nearest match to the values. If a value can't
+                    be matched a None is returned
+                """
+                variables_size = len(variables)
+                closest = None
+                min_diff = 9999999999.99
+                for index_offset in range(-2, 3):
+                    test_index = value_index + index_offset
+                    if test_index < 0 or test_index >= variables_size:
+                        continue
+                    test_variable = variables[test_index:test_index + 1].data[0]
+                    cur_diff = abs(test_variable - value)
+                    if cur_diff < min_diff:
+                        closest = test_index
+                        min_diff = cur_diff
+
+                return closest
+
+            min_y_nearest = find_closest_index(lon_min, min_y, longitudes)
+            if None in min_y_nearest:
+                raise RuntimeError("Unable to find index for minimum Y location value")
+            max_y_nearest = find_closest_index(lon_max, max_y, longitudes)
+            if None in max_y_nearest:
+                raise RuntimeError("Unable to find index for maximum Y location value")
+            min_x_nearest = find_closest_index(lat_min, min_x, latitudes)
+            if None in min_x_nearest:
+                raise RuntimeError("Unable to find index for minimum X location value")
+            max_x_nearest = find_closest_index(lat_max, max_x, latitudes)
+            if None in max_x_nearest:
+                raise RuntimeError("Unable to find index for maximum X location value")
+
+            if min_y_nearest > max_y_nearest:
+                min_y_nearest, max_y_nearest = max_y_nearest, min_y_nearest
+            if min_x_nearest > max_x_nearest:
+                min_x_nearest, max_x_nearest = max_x_nearest, min_x_nearest
+
+            closest_offsets.append(min_y_nearest)
+            closest_offsets.append(max_y_nearest)
+            closest_offsets.append(min_x_nearest)
+            closest_offsets.append(max_x_nearest)
+
+        logging.debug("Closest indexes: %s", str(closest_offsets))
+        return closest_offsets
+
+    @staticmethod
+    def clip_netcdf(netcdf_path: str, clip_tuple: tuple, out_path: str) -> None:
+        """Clip netCDF file to polygon.
+        Arguments:
+          netcdf_path: path to netCDF file
+          clip_tuple: tuple containing (minX, maxX, minY, maxY) of clip bounds
+          out_path: output file to write
+        Notes:
+            The clip_tuple is assumed to be in the correct coordinate system of the netCDF file
+        """
+        logging.debug("Clipping netCDF file to plot tuple: %s", str(clip_tuple))
+
+        # Map the clip tuple to X and Y positions
+        closest_offsets = __internal__.netcdf_tuple_to_indexes(netcdf_path, clip_tuple)
+
+        # Make the NCO calls to clip
+        cmd = 'ncks'
+        command_params = ['-O',
+                          '-d',
+                          'x,{},{}'.format(closest_offsets[2], closest_offsets[3]),
+                          '-d y,{},{}'.format(closest_offsets[0], closest_offsets[1]),
+                          netcdf_path,
+                          out_path]
+        logging.debug("Running netCDF clipping command: '%s' parameters: %s", cmd, str(command_params))
+        run_result = subprocess.run([cmd, *command_params], check=True)
+        logging.debug("Command result: %s", run_result.returncode)
+        logging.debug("        output: %s", str(run_result.stdout))
+        logging.debug("         error: %s", str(run_result.stderr))
+
+    @staticmethod
     def cleanup_request_md(source_md: dict) -> dict:
         """Makes a copy of the source metadata and cleans it up for use as plot-level information
         Arguments:
@@ -283,26 +450,6 @@ class __internal__():
         new_md.pop('working_folder', None)
 
         return new_md
-
-    @staticmethod
-    def check_already_merged(merged_file: str, source_file: str) -> bool:
-        """Checks if the source file is listed in the merged file
-        Arguments:
-            merged_file: path to the merged file to check
-            source_file: the name of the source file to look for
-        Return:
-            Returns True if the source file name is found in the contents of the merged file and False otherwise
-        """
-        already_merged = False
-        if os.path.exists(merged_file):
-            # Check if contents
-            with open(merged_file, 'r') as contents:
-                for entry in contents.readlines():
-                    if entry.strip() == source_file:
-                        already_merged = True
-                        break
-        return already_merged
-
 
     @staticmethod
     def prepare_container_md(plot_name: str, plot_md: dict, sensor: str, source_file: str, result_files: list) -> dict:
@@ -389,6 +536,7 @@ class __internal__():
 
         return dest_md
 
+
 def add_parameters(parser: argparse.ArgumentParser) -> None:
     """Adds parameters
     Arguments:
@@ -447,25 +595,26 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
             plot_md = __internal__.cleanup_request_md(check_md)
             plot_md['plot_name'] = plot_name
 
+            # Prepare for clipping. We use a lambda function to determine if we're actually clipping a file
+            # and to perform the clipping allowing us to simplify the code
+            clip_func = None
+            out_path = os.path.join(check_md['working_folder'], plot_name)
+            out_file = os.path.join(out_path, filename)
+            # Silence the following check since we run the lambda as soon as possible after it's defined
+            # pylint: disable=cell-var-from-loop
             if filename.endswith('.tif'):
                 # If file is a geoTIFF, simply clip it
-                out_path = os.path.join(check_md['working_folder'], plot_name)
-                out_file = os.path.join(out_path, filename)
-                if not os.path.exists(out_path):
-                    os.makedirs(out_path)
-
-                clip_raster(file_path, tuples, out_path=out_file, compress=True)
-
-                cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file])
-                container_md = __internal__.merge_container_md(container_md, cur_md)
-
+                clip_func = lambda: clip_raster(file_path, tuples, out_path=out_file, compress=True)
             elif filename.endswith('.las'):
-                out_path = os.path.join(check_md['working_folder'], plot_name)
-                out_file = os.path.join(out_path, filename)
+                clip_func = lambda: __internal__.clip_las(file_path, tuples, out_file)
+            elif filename.endswith('.nc'):
+                clip_func = lambda: __internal__.clip_netcdf(file_path, tuples, out_file)
+
+            if clip_func:
                 if not os.path.exists(out_path):
                     os.makedirs(out_path)
 
-                __internal__.clip_las(file_path, tuples, out_path=out_file)
+                clip_func()
 
                 cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file])
                 container_md = __internal__.merge_container_md(container_md, cur_md)

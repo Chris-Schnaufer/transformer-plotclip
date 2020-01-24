@@ -1,6 +1,6 @@
 # Version 1.0 template-transformer-simple 
 
-FROM agpipeline/gantry-base-image:latest
+FROM agpipeline/gantry-base-image:1.3
 LABEL maintainer="Chris Schnaufer <schnaufer@email.arizona.edu>"
 
 COPY requirements.txt packages.txt /home/extractor/
