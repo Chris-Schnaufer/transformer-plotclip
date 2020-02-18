@@ -134,12 +134,17 @@ class __internal__():
                 lat_max = src.variables['latitude'][x_size - 1:x_size].data[0]
                 lon_max = src.variables['longitude'][y_size - 1:y_size].data[0]
 
+                if lat_min > lat_max:
+                    lat_min, lat_max = lat_max, lat_min
+                if lon_min > lon_max:
+                    lon_min, lon_max = lon_max, lon_min
+
                 ring = ogr.Geometry(ogr.wkbLinearRing)
-                ring.AddPoint(lon_min, lat_min)  # Upper left
-                ring.AddPoint(lon_max, lat_min)  # Upper right
-                ring.AddPoint(lon_max, lat_max)  # lower right
-                ring.AddPoint(lon_min, lat_max)  # lower left
-                ring.AddPoint(lon_min, lat_min)  # Closing the polygon
+                ring.AddPoint(lon_min, lat_max)  # Upper left
+                ring.AddPoint(lon_max, lat_max)  # Upper right
+                ring.AddPoint(lon_max, lat_min)  # lower right
+                ring.AddPoint(lon_min, lat_min)  # lower left
+                ring.AddPoint(lon_min, lat_max)  # Closing the polygon
 
                 poly = ogr.Geometry(ogr.wkbPolygon)
                 poly.AddGeometry(ring)
@@ -150,8 +155,9 @@ class __internal__():
                     return geometry_to_geojson(poly)
 
                 logging.error("Failed to import EPSG %s for las file %s", str(epsg), file_path)
-        except Exception:
+        except Exception as ex:
             logging.exception("Exception caught while determining netCDF file extents %s", file_path)
+            raise ex
 
         return None
 
@@ -536,6 +542,75 @@ class __internal__():
 
         return dest_md
 
+    def convert_geometry(geometry, new_spatialreference):
+        """Converts the geometry to the new spatial reference if possible
+
+        geometry - The geometry to transform
+        new_spatialreference - The spatial reference to change to
+
+        Returns:
+            The transformed geometry or the original geometry. If either the
+            new Spatial Reference parameter is None, or the geometry doesn't
+            have a spatial reference, then the original geometry is returned.
+        """
+        if not new_spatialreference or not geometry:
+            return geometry
+
+        return_geometry = geometry
+        try:
+            geom_sr = geometry.GetSpatialReference()
+            if geom_sr and not new_spatialreference.IsSame(geom_sr):
+                transform = osr.CreateCoordinateTransformation(geom_sr, new_spatialreference)
+                new_geom = geometry.Clone()
+                if new_geom:
+                    new_geom.Transform(transform)
+                    return_geometry = new_geom
+        except Exception as ex:
+            logging.warning("Exception caught while transforming geometries: " + str(ex))
+            logging.warning("    Returning original geometry")
+
+        return return_geometry
+
+    def find_plots_intersect_boundingbox(bounding_box, all_plots, fullmac=True):
+        """Take a list of plots from BETY and return only those overlapping bounding box.
+
+        fullmac -- only include full plots (omit KSU, omit E W partial plots)
+
+        """
+        bbox_poly = ogr.CreateGeometryFromJson(str(bounding_box))
+        bb_sr = bbox_poly.GetSpatialReference()
+        intersecting_plots = dict()
+
+        for plotname in all_plots:
+            if fullmac and (plotname.find("KSU") > -1 or plotname.endswith(" E") or plotname.endswith(" W")):
+                continue
+
+            bounds = all_plots[plotname]
+            if 'Season 4 Range 37 Column 15' in plotname:
+                logging.debug("Checking plot %s: %s", plotname, str(bounds))
+
+            yaml_bounds = yaml.safe_load(bounds)
+            current_poly = ogr.CreateGeometryFromJson(json.dumps(yaml_bounds))
+
+            # Check for a need to convert coordinate systems
+            check_poly = current_poly
+            if bb_sr:
+                poly_sr = current_poly.GetSpatialReference()
+                if poly_sr and not bb_sr.IsSame(poly_sr):
+                    # We need to convert to the same coordinate system before an intersection
+                    logging.debug("    Converting to new coordinate system")
+                    check_poly = __internal__.convert_geometry(current_poly, bb_sr)
+
+            intersection_with_bounding_box = bbox_poly.Intersection(check_poly)
+
+            if intersection_with_bounding_box is not None:
+                intersection = json.loads(intersection_with_bounding_box.ExportToJson())
+                if 'coordinates' in intersection and len(intersection['coordinates']) > 0:
+                    logging.debug("  HAVE INTERSECTION")
+                    intersecting_plots[plotname] = bounds
+
+        return intersecting_plots
+
 
 def add_parameters(parser: argparse.ArgumentParser) -> None:
     """Adds parameters
@@ -568,6 +643,7 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
 
     # Get all the possible plots
     datestamp = check_md['timestamp'][0:10]
+    logging.debug("Using datestamp %s (%s)", datestamp, check_md['timestamp'])
     all_plots = get_site_boundaries(datestamp, city='Maricopa')
     logging.debug("Have %s plots for site", len(all_plots))
 
@@ -578,8 +654,9 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
         file_bounds = files_to_process[filename]['bounds']
         sensor = files_to_process[filename]['sensor_name']
         logging.debug("File bounds: %s", str(file_bounds))
+        logging.debug("First plot: %s", str(all_plots)[0:1000])
 
-        overlap_plots = find_plots_intersect_boundingbox(file_bounds, all_plots, fullmac=True)
+        overlap_plots = __internal__.find_plots_intersect_boundingbox(file_bounds, all_plots, fullmac=True)
         logging.info("Have %s plots intersecting file '%s'", str(len(overlap_plots)), filename)
 
         file_spatial_ref = __internal__.get_spatial_reference_from_json(file_bounds)
