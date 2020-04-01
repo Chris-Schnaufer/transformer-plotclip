@@ -45,4 +45,5 @@ Note that the paths provided are relative to the running image (see the --mount 
 
 ## Previous Version's Discontinued Features
 
+- 4/1/2020: defaults to clipping RGB to the only the plot-image intersection by default; the `--full_plot_fill` command line flag restores previous default behavior
 - version 2.0 merged clipped LAS files into a single file
