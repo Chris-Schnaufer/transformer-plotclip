@@ -209,6 +209,9 @@ class __internal__():
             filename = os.path.basename(one_file)
             if filename in files_to_process:
                 continue
+            if not os.path.exists(one_file):
+                logging.warning("Skipping file that does not exist: '%s'", one_file)
+                continue
 
             if one_file.endswith('.tif'):
                 files_to_process[filename] = {
@@ -265,6 +268,51 @@ class __internal__():
             logging.warning("Exception caught while calculating shape overlap: %s", str(ex))
 
         return 0.0
+
+    @staticmethod
+    def clip_raster_intersection(file_path: str, file_bounds: str, plot_bounds: str, out_file: str) -> Optional[int]:
+        """Clips the raster to the intersection of the file bounds and plot bounds
+        Arguments:
+            file_path: the path to the source file
+            file_bounds: the geometric boundary of the source file as JSON
+            plot_bounds: the geometric boundary of the plot to clip to as JSON
+            out_file: the path to store the clipped image
+        Return:
+            The number of pixels in the new image, or None if no pixels were saved
+        Notes:
+            Assumes the boundaries are in the same coordinate system
+        Exceptions:
+            Raises RuntimeError if the polygons are invalid
+        """
+        logging.debug("Clip to intersect of plot boundary: File: '%s' '%s' Plot: '%s'", file_path, str(file_bounds), str(plot_bounds))
+        try:
+            file_poly = ogr.CreateGeometryFromJson(str(file_bounds))
+            plot_poly = ogr.CreateGeometryFromJson(str(plot_bounds))
+
+            if not file_poly or not plot_poly:
+                logging.error("Invalid polygon specified for clip_raster_intersection: File: '%s' plot: '%s'",
+                              str(file_bounds), str(plot_bounds))
+                raise RuntimeError("One or more invalid polygons specified when clipping raster")
+
+            intersection = file_poly.Intersection(plot_poly)
+            if not intersection or not intersection.Area():
+                logging.info("File does not intersect plot boundary: %s", file_path)
+                return None
+
+            # Make sure we pass a multipolygon down to the tuple converter
+            if intersection.GetGeometryName().startswith('MULTI'):
+                multi_polygon = intersection
+            else:
+                multi_polygon = ogr.Geometry(ogr.wkbMultiPolygon)
+                multi_polygon.AddGeometry(intersection)
+
+            # Proceed to clip to the intersection
+            tuples = geojson_to_tuples_betydb(json.loads(geometry_to_geojson(multi_polygon)))
+            return clip_raster(file_path, tuples, out_path=out_file, compress=True)
+
+        except Exception as ex:
+            logging.exception("Exception caught while clipping image to plot intersection")
+            raise ex
 
     @staticmethod
     def cleanup_request_md(source_md: dict) -> dict:
@@ -396,6 +444,8 @@ def add_parameters(parser: argparse.ArgumentParser) -> None:
     """
     parser.add_argument('--epsg', type=int, nargs='?',
                         help='default epsg code to use if a files doesn\'t have a coordinate system')
+    parser.add_argument('--full_plot_fill', action='store_true',
+                        help='clipped images will be color filled to match the plot dimensions (outside the original image boundaries)')
     parser.add_argument('sensor', type=str, help='the name of the sensor associated with the source files')
 
 
@@ -418,57 +468,62 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
     files_to_process = __internal__.get_files_to_process(file_list, transformer.args.sensor, transformer.args.epsg)
     logging.info("Found %s files to process", str(len(files_to_process)))
 
-    # Get all the possible plots
-    datestamp = check_md['timestamp'][0:10]
-    all_plots = get_site_boundaries(datestamp, city='Maricopa')
-    logging.debug("Have %s plots for site", len(all_plots))
-
     container_md = []
-    for filename in files_to_process:
-        processed_files += 1
-        file_path = files_to_process[filename]['path']
-        file_bounds = files_to_process[filename]['bounds']
-        sensor = files_to_process[filename]['sensor_name']
-        logging.debug("File bounds: %s", str(file_bounds))
+    if files_to_process:
+        # Get all the possible plots
+        datestamp = check_md['timestamp'][0:10]
+        all_plots = get_site_boundaries(datestamp, city='Maricopa')
+        logging.debug("Have %s plots for site", len(all_plots))
 
-        overlap_plots = find_plots_intersect_boundingbox(file_bounds, all_plots, fullmac=True)
-        logging.info("Have %s plots intersecting file '%s'", str(len(overlap_plots)), filename)
+        for filename in files_to_process:
+            processed_files += 1
+            file_path = files_to_process[filename]['path']
+            file_bounds = files_to_process[filename]['bounds']
+            sensor = files_to_process[filename]['sensor_name']
+            logging.debug("File bounds: %s", str(file_bounds))
 
-        file_spatial_ref = __internal__.get_spatial_reference_from_json(file_bounds)
-        for plot_name in overlap_plots:
-            processed_plots += 1
-            plot_bounds = convert_json_geometry(overlap_plots[plot_name], file_spatial_ref)
-            logging.debug("Clipping out plot '%s': %s", str(plot_name), str(plot_bounds))
-            if __internal__.calculate_overlap_percent(plot_bounds, file_bounds) < 0.10:
-                logging.info("Skipping plot with too small overlap: %s", plot_name)
-                continue
-            tuples = geojson_to_tuples_betydb(yaml.safe_load(plot_bounds))
+            overlap_plots = find_plots_intersect_boundingbox(file_bounds, all_plots, fullmac=True)
+            logging.info("Have %s plots intersecting file '%s'", str(len(overlap_plots)), filename)
 
-            plot_md = __internal__.cleanup_request_md(check_md)
-            plot_md['plot_name'] = plot_name
+            file_spatial_ref = __internal__.get_spatial_reference_from_json(file_bounds)
+            for plot_name in overlap_plots:
+                processed_plots += 1
+                plot_bounds = convert_json_geometry(overlap_plots[plot_name], file_spatial_ref)
+                logging.debug("Clipping out plot '%s': %s", str(plot_name), str(plot_bounds))
+                if __internal__.calculate_overlap_percent(plot_bounds, file_bounds) < 0.10:
+                    logging.info("Skipping plot with too small overlap: %s", plot_name)
+                    continue
+                tuples = geojson_to_tuples_betydb(yaml.safe_load(plot_bounds))
 
-            if filename.endswith('.tif'):
-                # If file is a geoTIFF, simply clip it
-                out_path = os.path.join(check_md['working_folder'], plot_name)
-                out_file = os.path.join(out_path, filename)
-                if not os.path.exists(out_path):
-                    os.makedirs(out_path)
+                plot_md = __internal__.cleanup_request_md(check_md)
+                plot_md['plot_name'] = plot_name
 
-                clip_raster(file_path, tuples, out_path=out_file, compress=True)
+                if filename.endswith('.tif'):
+                    # If file is a geoTIFF, simply clip it
+                    out_path = os.path.join(check_md['working_folder'], plot_name)
+                    out_file = os.path.join(out_path, filename)
+                    if not os.path.exists(out_path):
+                        os.makedirs(out_path)
 
-                cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file])
-                container_md = __internal__.merge_container_md(container_md, cur_md)
+                    if not transformer.args.full_plot_fill:
+                        __internal__.clip_raster_intersection(file_path, file_bounds, plot_bounds, out_file)
+                    else:
+                        logging.info("Clipping image to plot boundary with fill")
+                        clip_raster(file_path, tuples, out_path=out_file, compress=True)
 
-            elif filename.endswith('.las'):
-                out_path = os.path.join(check_md['working_folder'], plot_name)
-                out_file = os.path.join(out_path, filename)
-                if not os.path.exists(out_path):
-                    os.makedirs(out_path)
+                    cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file])
+                    container_md = __internal__.merge_container_md(container_md, cur_md)
 
-                __internal__.clip_las(file_path, tuples, out_path=out_file)
+                elif filename.endswith('.las'):
+                    out_path = os.path.join(check_md['working_folder'], plot_name)
+                    out_file = os.path.join(out_path, filename)
+                    if not os.path.exists(out_path):
+                        os.makedirs(out_path)
 
-                cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file])
-                container_md = __internal__.merge_container_md(container_md, cur_md)
+                    __internal__.clip_las(file_path, tuples, out_path=out_file)
+
+                    cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file])
+                    container_md = __internal__.merge_container_md(container_md, cur_md)
 
     return {
         'code': 0,
