@@ -19,7 +19,7 @@ import numpy as np
 import osr
 
 from terrautils.imagefile import image_get_geobounds, get_epsg
-from terrautils.spatial import find_plots_intersect_boundingbox, geojson_to_tuples_betydb, clip_raster, \
+from terrautils.spatial import find_plots_intersect_boundingbox, clip_raster, \
      geometry_to_geojson, convert_json_geometry
 from terrautils.betydb import get_site_boundaries
 import terrautils.lemnatec
@@ -244,6 +244,20 @@ class __internal__():
         return None
 
     @staticmethod
+    def geojson_to_tuples(bounding_box: str) -> tuple:
+        """Returns the bounds of the shape
+        Arguments:
+            bounding_box: the JSON of the geometry
+        Return:
+            A tuple containing the bounds in (min Y, max Y, min X, max X) order
+        """
+        yaml_geom = yaml.safe_load(bounding_box)
+        current_geom = ogr.CreateGeometryFromJson(json.dumps(yaml_geom))
+        current_env = current_geom.GetEnvelope()
+
+        return current_env[2], current_env[3], current_env[0], current_env[1]
+
+    @staticmethod
     def calculate_overlap_percent(check_bounds: str, bounding_box: str) -> float:
         """Calculates and returns the percentage overlap between the two boundaries.
            The calculation determines the overlap shape between the two parameters and
@@ -307,7 +321,7 @@ class __internal__():
                 multi_polygon.AddGeometry(intersection)
 
             # Proceed to clip to the intersection
-            tuples = geojson_to_tuples_betydb(json.loads(geometry_to_geojson(multi_polygon)))
+            tuples = __internal__.geojson_to_tuples(geometry_to_geojson(multi_polygon))
             return clip_raster(file_path, tuples, out_path=out_file, compress=True)
 
         except Exception as ex:
@@ -493,7 +507,7 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
                 if __internal__.calculate_overlap_percent(plot_bounds, file_bounds) < 0.10:
                     logging.info("Skipping plot with too small overlap: %s", plot_name)
                     continue
-                tuples = geojson_to_tuples_betydb(yaml.safe_load(plot_bounds))
+                tuples = __internal__.geojson_to_tuples(plot_bounds)
 
                 plot_md = __internal__.cleanup_request_md(check_md)
                 plot_md['plot_name'] = plot_name
