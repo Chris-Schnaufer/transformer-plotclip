@@ -10,24 +10,21 @@ import os
 import re
 import subprocess
 from typing import Optional
-
+import requests
+from osgeo import gdal, ogr, osr
 import yaml
 import liblas
-
-from osgeo import ogr
 import numpy as np
-import osr
-
-from terrautils.imagefile import image_get_geobounds, get_epsg
-from terrautils.spatial import find_plots_intersect_boundingbox, clip_raster, \
-     geometry_to_geojson, convert_json_geometry
-from terrautils.betydb import get_site_boundaries
-import terrautils.lemnatec
 
 import configuration
 import transformer_class
 
-terrautils.lemnatec.SENSOR_METADATA_CACHE = os.path.dirname(os.path.realpath(__file__))
+BETYDB_URL = "https://terraref.ncsa.illinois.edu/bety"
+BETYDB_LOCAL_CACHE_FOLDER = os.environ.get('BETYDB_LOCAL_CACHE_FOLDER', '/home/extractor/')
+
+BETYDB_CULTIVARS = None
+BETYDB_TRAITS = None
+BETYDB_EXPERIMENTS = None
 
 
 class __internal__():
@@ -37,6 +34,390 @@ class __internal__():
     def __init__(self):
         """Initializes class instance
         """
+
+    @staticmethod
+    def get_bety_key():
+        """return key from environment or ~/.betykey if it exists."""
+
+        key = os.environ.get('BETYDB_KEY', '')
+        if key:
+            return key
+
+        keyfile_path = os.path.expanduser('~/.betykey')
+        if os.path.exists(keyfile_path):
+            keyfile = open(keyfile_path, "r")
+            return keyfile.readline().strip()
+
+        raise RuntimeError("BETYDB_KEY not found. Set environmental variable " +
+                           "or create $HOME/.betykey.")
+
+    @staticmethod
+    def get_bety_url(path=''):
+        """return betydb url from environment with optional path
+
+        Of 3 options string join, os.path.join and urlparse.urljoin, os.path.join
+        is the best at handling excessive / characters.
+        """
+
+        url = os.environ.get('BETYDB_URL', BETYDB_URL)
+        return os.path.join(url, path)
+
+    @staticmethod
+    def get_bety_api(endpoint=None):
+        """return betydb API based on betydb url"""
+
+        url = __internal__.get_bety_url(path='api/v1/{}'.format(endpoint))
+        return url
+
+    @staticmethod
+    def query(endpoint="search", **kwargs):
+        """return betydb API results.
+
+        This is general function for querying the betyDB API. It automatically
+        decodes the json response if one is returned.
+        """
+
+        payload = {'key': __internal__.get_bety_key()}
+        payload.update(kwargs)
+
+        req = requests.get(__internal__.get_bety_api(endpoint), params=payload)
+        req.raise_for_status()
+        return req.json()
+
+    @staticmethod
+    def get_experiments(**kwargs):
+        """Return cleaned up array from query() for the experiments table.
+            If global variable isn't populated, check if a local file is present and read from it if so.
+            This is for deployments where data is pre-fetched (e.g. for a Condor job).
+            Otherwise the BETY API will be called.
+            In either case, data will be kept in memory for subsequent calls.
+        """
+        global BETYDB_EXPERIMENTS
+
+        if BETYDB_EXPERIMENTS is None:
+            cache_file = os.path.join(BETYDB_LOCAL_CACHE_FOLDER, "bety_experiments.json")
+            if os.path.exists(cache_file):
+                with open(cache_file) as infile:
+                    query_data = json.load(infile)
+                    if query_data:
+                        if 'associations_mode' in kwargs:
+                            BETYDB_EXPERIMENTS = query_data
+                        return [t["experiment"] for t in query_data['data']]
+            else:
+                query_data = __internal__.query(endpoint="experiments", **kwargs)
+                if query_data:
+                    if 'associations_mode' in kwargs:
+                        BETYDB_EXPERIMENTS = query_data
+                    return [t["experiment"] for t in query_data['data']]
+        else:
+            return [t["experiment"] for t in BETYDB_EXPERIMENTS['data']]
+
+        return []
+
+    @staticmethod
+    def get_sites(filter_date='', include_halves=False, **kwargs):
+        """Return a site array from query() from the sites table.
+
+        e.g.
+                get_sites(city="Maricopa")
+                get_sites(sitename="MAC Field Scanner Season 4 Range 4 Column 6")
+                get_sites(contains="-111.97496613200647,33.074671230742446")
+
+          filter_date -- YYYY-MM-DD to filter sites to specific experiment by date
+        """
+
+        if not filter_date:
+            # SCENARIO I - NO FILTER DATE
+            # Basic query, efficient even with 'containing' parameter.
+            query_data = __internal__.query(endpoint="sites", limit='none', **kwargs)
+            if query_data:
+                return [t["site"] for t in query_data['data']]
+        else:
+            # SCENARIO II - YES FILTER DATE
+            # Get experiments by date and return all associated sites, optionally filtering by location.
+            targ_date = datetime.datetime.strptime(filter_date, '%Y-%m-%d')
+            query_data = __internal__.get_experiments(associations_mode='full_info', limit='none', **kwargs)
+            if query_data:
+                results = []
+                for exp in query_data:
+                    start = datetime.datetime.strptime(exp['start_date'], '%Y-%m-%d')
+                    end = datetime.datetime.strptime(exp['end_date'], '%Y-%m-%d')
+                    if start <= targ_date <= end and 'sites' in exp:
+                        for one_entry in exp['sites']:
+                            site = one_entry['site']
+                            if (site["sitename"].endswith(" W") or site["sitename"].endswith(" E")) \
+                                    and not include_halves:
+                                continue
+                            if 'containing' in kwargs:
+                                # Need to filter additionally by geometry
+                                site_geom = ogr.CreateGeometryFromWkt(site['geometry'])
+                                coords = kwargs['containing'].split(",")
+                                pt_geom = ogr.CreateGeometryFromWkt("POINT(%s %s)" % (coords[1], coords[0]))
+                                if site_geom.Intersects(pt_geom):
+                                    if site not in results:
+                                        results.append(site)
+                            else:
+                                # If no containing parameter, include all sites
+                                if site not in results:
+                                    results.append(site)
+                return results
+            logging.error("No experiment data could be retrieved.")
+
+        return []
+
+    @staticmethod
+    def get_site_boundaries(filter_date='', **kwargs):
+        """Get a dictionary of site GeoJSON bounding boxes filtered by standard arguments.
+
+        filter_date -- YYYY-MM-DD to filter sites to specific experiment by date
+
+        Returns:
+            {
+                'sitename_1': 'geojson bbox',
+                'sitename_2': 'geojson bbox',
+                ...
+             }
+        """
+
+        sitelist = __internal__.get_sites(filter_date, **kwargs)
+        bboxes = {}
+
+        for site in sitelist:
+            geom = ogr.CreateGeometryFromWkt(site['geometry'])
+
+            if geom:
+                bboxes[site['sitename']] = __internal__.geometry_to_geojson(geom, 'EPSG', '4326')
+            else:
+                logging.error("Site boundary geometry is invalid for site: %s", site['sitename'])
+
+        return bboxes
+
+    @staticmethod
+    def convert_json_geometry(geojson: str, new_spatialreference: Optional[osr.SpatialReference]) -> str:
+        """Converts geojson geometry to new spatial reference system and
+           returns the new geometry as geojson.
+        Arguments:
+            geojson: The geometry to transform
+            new_spatialreference: The spatial reference to change to
+        Return:
+            The transformed geometry as geojson or the original geojson. If
+            either the new Spatial Reference parameter is None, or the geojson
+            doesn't have a spatial reference, or the geojson isn't a
+            valid geometry, then the original geojson is returned.
+        """
+        if not new_spatialreference or not geojson:
+            return geojson
+
+        geom_yaml = yaml.safe_load(geojson)
+        geometry = ogr.CreateGeometryFromJson(json.dumps(geom_yaml))
+
+        if not geometry:
+            return geojson
+
+        new_geometry = __internal__.convert_geometry(geometry, new_spatialreference)
+        if not new_geometry:
+            return geojson
+
+        try:
+            return __internal__.geometry_to_geojson(new_geometry)
+        except Exception as ex:
+            logging.warning("Exception caught while transforming geojson: %s", str(ex))
+            logging.warning("    Returning original geojson")
+
+        return geojson
+
+    @staticmethod
+    def geometry_to_geojson(geom: ogr.Geometry, alt_coord_type: str = None, alt_coord_code: str = None) -> str:
+        """Converts a geometry to geojson.
+        Args:
+            geom: The geometry to convert to JSON
+            alt_coord_type: the alternate geographic coordinate system type if geometry doesn't have one defined
+            alt_coord_code: the alternate geographic coordinate system associated with the type
+        Returns:
+            The geojson string for the geometry
+        Note:
+            If the geometry doesn't have a spatial reference associated with it, both the default
+            coordinate system type and code must be specified for a coordinate system to be assigned to
+            the returning JSON. The original geometry is left unaltered.
+        """
+        ref_sys = geom.GetSpatialReference()
+        geom_json = json.loads(geom.ExportToJson())
+        if not ref_sys:
+            if alt_coord_type and alt_coord_code:
+                geom_json['crs'] = {'type': str(alt_coord_type), 'properties': {'code': str(alt_coord_code)}}
+        else:
+            geom_json['crs'] = {
+                'type': ref_sys.GetAttrValue("AUTHORITY", 0),
+                'properties': {
+                    'code': ref_sys.GetAttrValue("AUTHORITY", 1)
+                }
+            }
+
+        return json.dumps(geom_json)
+
+    @staticmethod
+    def convert_geometry(geometry: ogr.Geometry, new_spatialreference: osr.SpatialReference) -> ogr.Geometry:
+        """Converts the geometry to the new spatial reference if possible
+
+        geometry - The geometry to transform
+        new_spatialreference - The spatial reference to change to
+
+        Returns:
+            The transformed geometry or the original geometry. If either the
+            new Spatial Reference parameter is None, or the geometry doesn't
+            have a spatial reference, then the original geometry is returned.
+        """
+        if not new_spatialreference or not geometry:
+            return geometry
+
+        return_geometry = geometry
+        try:
+            geom_sr = geometry.GetSpatialReference()
+            if geom_sr and not new_spatialreference.IsSame(geom_sr):
+                transform = osr.CreateCoordinateTransformation(geom_sr, new_spatialreference)
+                new_geom = geometry.Clone()
+                if new_geom:
+                    new_geom.Transform(transform)
+                    return_geometry = new_geom
+        except Exception as ex:
+            logging.warning("Exception caught while transforming geometries: %s", str(ex))
+            logging.warning("    Returning original geometry")
+
+        return return_geometry
+
+    @staticmethod
+    def find_plots_intersect_boundingbox(bounding_box: str, all_plots: dict, fullmac: bool = True) -> dict:
+        """Take a list of plots from BETY and return only those overlapping bounding box.
+        Arguments:
+            bounding_box: the JSON of the bounding box
+            all_plots: the dictionary of all available plots
+            fullmac: only include full plots (omit KSU, omit E W partial plots)
+        Return:
+            A dictionary of all intersecting plots
+        """
+        bbox_poly = ogr.CreateGeometryFromJson(str(bounding_box))
+        bb_sr = bbox_poly.GetSpatialReference()
+        intersecting_plots = {}
+        logging.debug("HACK: Bounding box %s %s", str(bb_sr), str(bbox_poly))
+
+        for plotname in all_plots:
+            if fullmac and (plotname.find("KSU") > -1 or plotname.endswith(" E") or plotname.endswith(" W")):
+                continue
+
+            bounds = all_plots[plotname]
+
+            yaml_bounds = yaml.safe_load(bounds)
+            current_poly = ogr.CreateGeometryFromJson(json.dumps(yaml_bounds))
+
+            # Check for a need to convert coordinate systems
+            check_poly = current_poly
+            if bb_sr:
+                poly_sr = current_poly.GetSpatialReference()
+                if poly_sr and not bb_sr.IsSame(poly_sr):
+                    # We need to convert to the same coordinate system before an intersection
+                    check_poly = __internal__.convert_geometry(current_poly, bb_sr)
+
+            logging.debug("HACK: Intersection with %s", str(check_poly))
+            intersection_with_bounding_box = bbox_poly.Intersection(check_poly)
+
+            if intersection_with_bounding_box is not None:
+                intersection = json.loads(intersection_with_bounding_box.ExportToJson())
+                if 'coordinates' in intersection and len(intersection['coordinates']) > 0:
+                    intersecting_plots[plotname] = bounds
+
+        return intersecting_plots
+
+    @staticmethod
+    def image_get_geobounds(filename: str) -> list:
+        """Uses gdal functionality to retrieve recilinear boundaries from the file
+
+        Args:
+            filename(str): path of the file to get the boundaries from
+
+        Returns:
+            The upper-left and calculated lower-right boundaries of the image in a list upon success.
+            The values are returned in following order: min_y, max_y, min_x, max_x. A list of numpy.nan
+            in each position is returned if the boundaries can't be determined
+        """
+        try:
+            src = gdal.Open(filename)
+            ulx, xres, _, uly, _, yres = src.GetGeoTransform()
+            lrx = ulx + (src.RasterXSize * xres)
+            lry = uly + (src.RasterYSize * yres)
+
+            min_y = min(uly, lry)
+            max_y = max(uly, lry)
+            min_x = min(ulx, lrx)
+            max_x = max(ulx, lrx)
+
+            return [min_y, max_y, min_x, max_x]
+        except Exception as ex:
+            logging.info("[image_get_geobounds] Exception caught: %s", str(ex))
+            if logging.getLogger().level == logging.DEBUG:
+                logging.exception("[image_get_geobounds] Exception")
+
+        return [np.nan, np.nan, np.nan, np.nan]
+
+    @staticmethod
+    def clip_raster(rast_path: str, bounds: tuple, out_path: str = None, nodata: int = -9999, compress: bool = False) ->\
+            Optional[np.ndarray]:
+        """Clip raster to polygon.
+        Arguments:
+            rast_path: path to raster file
+            bounds: (min_y, max_y, min_x, max_x)
+            out_path: if provided, where to save as output file
+            nodata: the no data value
+            compress: set to True to compress the image and False to leave it uncompressed
+        Returns:
+            The array of clipped pixels
+        Notes:
+            Oddly, the "features path" can be either a filename
+            OR a geojson string. GDAL seems to figure it out and do
+            the right thing.
+            From http://karthur.org/2015/clipping-rasters-in-python.html
+        """
+        if not out_path:
+            out_path = "temp.tif"
+
+        # Clip raster to GDAL and read it to numpy array
+        coords = "%s %s %s %s" % (bounds[2], bounds[1], bounds[3], bounds[0])
+        if compress:
+            cmd = 'gdal_translate -projwin %s "%s" "%s"' % (coords, rast_path, out_path)
+        else:
+            cmd = 'gdal_translate -co COMPRESS=LZW -projwin %s "%s" "%s"' % (coords, rast_path, out_path)
+        subprocess.call(cmd, shell=True, stdout=open(os.devnull, 'wb'))
+        out_px = np.array(gdal.Open(out_path).ReadAsArray())
+
+        if np.count_nonzero(out_px) > 0:
+            if out_path == "temp.tif":
+                os.remove(out_path)
+            return out_px
+
+        os.remove(out_path)
+        return None
+
+    @staticmethod
+    def get_epsg(filename: str) -> Optional[str]:
+        """Returns the EPSG of the georeferenced image file
+        Args:
+            filename(str): path of the file to retrieve the EPSG code from
+        Return:
+            Returns the found EPSG code, or None if it's not found or an error ocurred
+        """
+        logger = logging.getLogger(__name__)
+
+        try:
+            src = gdal.Open(filename)
+
+            proj = osr.SpatialReference(wkt=src.GetProjection())
+
+            return proj.GetAttrValue('AUTHORITY', 1)
+        except Exception as ex:
+            logger.warning("[get_epsg] Exception caught: %s", str(ex))
+            if logging.getLogger().level == logging.DEBUG:
+                logging.exception("[get_epsg] Exception")
+
+        return None
 
     @staticmethod
     def get_las_epsg_from_header(header: liblas.header.Header) -> str:
@@ -105,7 +486,7 @@ class __internal__():
         ref_sys = osr.SpatialReference()
         if ref_sys.ImportFromEPSG(int(epsg)) == ogr.OGRERR_NONE:
             poly.AssignSpatialReference(ref_sys)
-            return geometry_to_geojson(poly)
+            return __internal__.geometry_to_geojson(poly)
 
         logging.error("Failed to import EPSG %s for las file %s", str(epsg), file_path)
         return None
@@ -162,11 +543,11 @@ class __internal__():
             of the image is not returned (None) and a warning is logged.
         """
         # Get the bounds (if they exist)
-        bounds = image_get_geobounds(file_path)
+        bounds = __internal__.image_get_geobounds(file_path)
         if bounds[0] == np.nan:
             return None
 
-        epsg = get_epsg(file_path)
+        epsg = __internal__.get_epsg(file_path)
         if epsg is None:
             if default_epsg:
                 epsg = default_epsg
@@ -188,7 +569,7 @@ class __internal__():
         ref_sys = osr.SpatialReference()
         if ref_sys.ImportFromEPSG(int(epsg)) == ogr.OGRERR_NONE:
             poly.AssignSpatialReference(ref_sys)
-            return geometry_to_geojson(poly)
+            return __internal__.geometry_to_geojson(poly)
 
         logging.error("Failed to import EPSG %s for image file %s", str(epsg), file_path)
         return None
@@ -321,8 +702,8 @@ class __internal__():
                 multi_polygon.AddGeometry(intersection)
 
             # Proceed to clip to the intersection
-            tuples = __internal__.geojson_to_tuples(geometry_to_geojson(multi_polygon))
-            return clip_raster(file_path, tuples, out_path=out_file, compress=True)
+            tuples = __internal__.geojson_to_tuples(__internal__.geometry_to_geojson(multi_polygon))
+            return __internal__.clip_raster(file_path, tuples, out_path=out_file, compress=True)
 
         except Exception as ex:
             logging.exception("Exception caught while clipping image to plot intersection")
@@ -364,7 +745,6 @@ class __internal__():
                         already_merged = True
                         break
         return already_merged
-
 
     @staticmethod
     def prepare_container_md(plot_name: str, plot_md: dict, sensor: str, source_file: str, result_files: list) -> dict:
@@ -451,6 +831,7 @@ class __internal__():
 
         return dest_md
 
+
 def add_parameters(parser: argparse.ArgumentParser) -> None:
     """Adds parameters
     Arguments:
@@ -486,7 +867,7 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
     if files_to_process:
         # Get all the possible plots
         datestamp = check_md['timestamp'][0:10]
-        all_plots = get_site_boundaries(datestamp, city='Maricopa')
+        all_plots = __internal__.get_site_boundaries(datestamp, city='Maricopa')
         logging.debug("Have %s plots for site", len(all_plots))
 
         for filename in files_to_process:
@@ -496,13 +877,13 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
             sensor = files_to_process[filename]['sensor_name']
             logging.debug("File bounds: %s", str(file_bounds))
 
-            overlap_plots = find_plots_intersect_boundingbox(file_bounds, all_plots, fullmac=True)
+            overlap_plots = __internal__.find_plots_intersect_boundingbox(file_bounds, all_plots, fullmac=True)
             logging.info("Have %s plots intersecting file '%s'", str(len(overlap_plots)), filename)
 
             file_spatial_ref = __internal__.get_spatial_reference_from_json(file_bounds)
             for plot_name in overlap_plots:
                 processed_plots += 1
-                plot_bounds = convert_json_geometry(overlap_plots[plot_name], file_spatial_ref)
+                plot_bounds = __internal__.convert_json_geometry(overlap_plots[plot_name], file_spatial_ref)
                 logging.debug("Clipping out plot '%s': %s", str(plot_name), str(plot_bounds))
                 if __internal__.calculate_overlap_percent(plot_bounds, file_bounds) < 0.10:
                     logging.info("Skipping plot with too small overlap: %s", plot_name)
@@ -523,7 +904,7 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
                         __internal__.clip_raster_intersection(file_path, file_bounds, plot_bounds, out_file)
                     else:
                         logging.info("Clipping image to plot boundary with fill")
-                        clip_raster(file_path, tuples, out_path=out_file, compress=True)
+                        __internal__.clip_raster(file_path, tuples, out_path=out_file, compress=True)
 
                     cur_md = __internal__.prepare_container_md(plot_name, plot_md, sensor, file_path, [out_file])
                     container_md = __internal__.merge_container_md(container_md, cur_md)
