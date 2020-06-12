@@ -15,6 +15,7 @@ from osgeo import gdal, ogr, osr
 import yaml
 import liblas
 import numpy as np
+from dbfread import DBF
 
 import configuration
 import transformer_class
@@ -191,6 +192,88 @@ class __internal__():
                 logging.error("Site boundary geometry is invalid for site: %s", site['sitename'])
 
         return bboxes
+
+    @staticmethod
+    def load_shapefile(shapefile: str, plot_column_name: str = None) -> list:
+        """Loads the shapefile and returns a list of geometries
+        Arguments:
+            shapefile: the path of the shapefile to load
+            plot_column_name: the name of the column containing the plot names
+        Return:
+            Returns the list of loaded plot boundaries
+        """
+        plots = []
+
+        # Setup to parse the shapefile
+        shape_in = ogr.Open(shapefile)
+        layer_name = os.path.split(os.path.splitext(shapefile)[0])[1]
+        if isinstance(layer_name, (bytes, bytearray)):
+            layer_name = layer_name.decode('utf8')
+        layer = shape_in.GetLayer(layer_name)
+        feature = layer.GetNextFeature()
+        layer_sr = layer.GetSpatialRef()
+
+        # Get out target Spatial Reference
+        default_sr = osr.SpatialReference()
+        default_sr.ImportFromEPSG(4326)
+
+        # Get the column name to use, if possible
+        dbffile = os.path.splitext(shapefile)[0] + ".dbf"
+        shape_table = DBF(dbffile, lowernames=True, ignore_missing_memofile=True)
+        shape_rows = iter(list(shape_table))
+
+        # Make sure if we have the column name of plot-names specified that it exists in
+        # the shapefile
+        column_names = shape_table.field_names
+        if plot_column_name is not None:
+            if plot_column_name not in column_names:
+                raise RuntimeError("Shapefile does not have specified plot name column '%s'" % plot_column_name)
+
+        # Lookup a plot name field to use
+        if plot_column_name is None:
+            for one_name in column_names:
+                if one_name == "observationUnitName":
+                    plot_column_name = one_name
+                    break
+                elif (one_name.find('plot') >= 0) and ((one_name.find('name') >= 0) or one_name.find('id')):
+                    plot_column_name = one_name
+                    break
+                elif one_name == 'id':
+                    plot_column_name = one_name
+                    break
+        if plot_column_name is None:
+            logging.warning("Shapefile data does not have a known plot name field; using default naming")
+
+        # Loop through each polygon and extract plot level data
+        alternate_plot_id = 0
+        logging.warning("About to loop through features")
+        while feature:
+            # Current geometry to extract
+            plot_poly = feature.GetGeometryRef()
+            if layer_sr:
+                plot_poly.AssignSpatialReference(layer_sr)
+            plot_spatial_ref = plot_poly.GetSpatialReference()
+
+            # Check if we need to convert the polygon coordinate system
+            if not plot_spatial_ref.IsSame(default_sr):
+                plot_poly = __internal__.convert_geometry(plot_poly, default_sr)
+
+            # Determine the plot name to use
+            plot_name = None
+            alternate_plot_id = alternate_plot_id + 1
+            if shape_rows and plot_column_name:
+                try:
+                    row = next(shape_rows)
+                    if plot_column_name in row:
+                        plot_name = str(row[plot_column_name])
+                except StopIteration:
+                    pass
+            if not plot_name:
+                plot_name = "plot_" + str(alternate_plot_id)
+
+            plots[plot_name] = __internal__.geometry_to_geojson(plot_poly)
+
+        return plots
 
     @staticmethod
     def convert_json_geometry(geojson: str, new_spatialreference: Optional[osr.SpatialReference]) -> str:
@@ -838,9 +921,12 @@ def add_parameters(parser: argparse.ArgumentParser) -> None:
         parser: instance of argparse
     """
     parser.add_argument('--epsg', type=int, nargs='?',
-                        help='default epsg code to use if a files doesn\'t have a coordinate system')
+                        help='default epsg code to use if a file doesn\'t have a coordinate system')
     parser.add_argument('--full_plot_fill', action='store_true',
                         help='clipped images will be color filled to match the plot dimensions (outside the original image boundaries)')
+    parser.add_argument('--shapefile', type=str, help='the path of the shapefile to use for plot boundaries')
+    parser.add_argument('--shapefile_plot_column', type=str,
+                        help='the name of the column in the shapefile containing plot names (defaults to "plot_" + row number)')
     parser.add_argument('sensor', type=str, help='the name of the sensor associated with the source files')
 
 
@@ -867,8 +953,11 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
     if files_to_process:
         # Get all the possible plots
         datestamp = check_md['timestamp'][0:10]
-        all_plots = __internal__.get_site_boundaries(datestamp, city='Maricopa')
-        logging.debug("Have %s plots for site", len(all_plots))
+        if transformer.args.shapefile:
+            all_plots = __internal__.load_shapefile(transformer.args.shapefile, transformer.args.shapefile_plot_column)
+        else:
+            all_plots = __internal__.get_site_boundaries(datestamp, city='Maricopa')
+            logging.debug("Have %s plots for site", len(all_plots))
 
         for filename in files_to_process:
             processed_files += 1
